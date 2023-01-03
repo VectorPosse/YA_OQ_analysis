@@ -1,0 +1,1186 @@
+---
+title: "Final analysis"
+output:
+    html_notebook:
+        toc: yes
+        toc_float: yes
+---
+
+# Data cleaning
+
+## Load libraries
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(skimr)
+library(knitr)
+library(cowplot)
+library(patchwork)
+library(broom)
+library(haven)
+library(lubridate)
+library(car)
+library(parallel)
+library(brms)
+library(bayesplot)
+library(tidybayes)
+library(shinystan)
+```
+
+Set `cache = TRUE` as global option:
+
+```{r}
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+
+## Import and clean data
+
+Import the SPSS file. (It's better to import this versus a CSV file because the SPSS file has labels we can use to check that we're grabbing the right variables.)
+
+```{r}
+YA_spss <- read_sav("./data/NATSAP_YA_full.sav")
+```
+
+
+```{r}
+names(YA_spss)
+```
+
+### Locate variables of interest
+
+#### Demographic data
+
+Gender:
+
+```{r}
+str(YA_spss$GENDER)
+```
+
+Date of birth is `YA_spss$ep01_dob`.
+
+Date of admission is `YA_spss$ep01_doa`.
+
+Date of discharge is `YA_spss$ep01_dod`.
+
+#### Ethnicity
+
+This appears in two places:
+
+```{r}
+str(YA_spss$ep01_ethnicity)
+```
+
+```{r}
+str(YA_spss$ep01_client_NATSAP_ADULT_I_A0_Q17)
+```
+
+Do the two columns agree?
+
+```{r}
+check_ethnicity <- YA_spss %>%
+    select(ethnicity1 = ep01_ethnicity,
+           ethnicity2 = ep01_client_NATSAP_ADULT_I_A0_Q17) %>%
+    transmute(ethnicity1 = as_factor(ethnicity1),
+              ethnicity2 = as_factor(ethnicity2)) %>%
+    group_by(ethnicity1, ethnicity2) %>%
+    summarise(count = n(), .groups = "drop")
+check_ethnicity
+```
+
+No, they don't match. We'll have to do some cleaning to merge these columns. We'll do this after we subset columns and remove data with missing values in key variables.
+
+#### Intake questions
+
+Affective motivation:
+
+```{r}
+str(YA_spss$ep01_client_NATSAP_ADULT_I_A0_Q10)
+```
+
+Cognitive motivation:
+
+```{r}
+str(YA_spss$ep01_client_NATSAP_ADULT_I_A0_Q13)
+```
+
+#### Discharge questions:
+
+Satisfaction:
+
+```{r}
+str(YA_spss$ep01_client_NATSAP_ADULT_D_D0_Q5)
+```
+
+Effort:
+
+```{r}
+str(YA_spss$ep01_client_NATSAP_ADULT_D_D0_Q6)
+```
+
+#### OQ scores
+
+Admit OQ:
+
+```{r}
+str(YA_spss$OQ_452_A_Total)
+```
+
+Discharge OQ:
+
+```{r}
+str(YA_spss$OQ_452_D_Total)
+```
+
+#### Program variables
+
+Facility type:
+
+```{r}
+str(YA_spss$FacilityType)
+```
+
+### Select and format variables
+
+```{r}
+YA_clean_full <- YA_spss %>%
+    dplyr::select(
+        gender = GENDER,
+        ethnicity1 = ep01_ethnicity,
+        ethnicity2 = ep01_client_NATSAP_ADULT_I_A0_Q17,
+        dob = ep01_dob,
+        doa = ep01_doa,
+        dod = ep01_dod,
+        affective_motivation =
+           ep01_client_NATSAP_ADULT_I_A0_Q10,
+        cognitive_motivation =
+           ep01_client_NATSAP_ADULT_I_A0_Q13,
+        satisfaction = ep01_client_NATSAP_ADULT_D_D0_Q5,
+        effort = ep01_client_NATSAP_ADULT_D_D0_Q6,
+        OQ_admit = OQ_452_A_Total,
+        OQ_discharge = OQ_452_D_Total,
+        facility = ep01_facility_company,
+        facility_type = FacilityType
+           )
+```
+
+### Deal with date variables
+
+Convert date variables to `datetime` format (for use with the `lubridate` package):
+
+```{r}
+YA_clean_full <- YA_clean_full %>%
+    mutate(dob = as_datetime(dob),
+           doa = as_datetime(doa),
+           dod = as_datetime(dod))
+```
+
+Calculate age at admission:
+
+```{r}
+YA_clean_full <- YA_clean_full %>%
+    mutate(age_at_admit = as.duration(interval(dob, doa)) %/%
+               as.duration(years(1)))
+```
+
+### Remove values not from population of interest
+
+```{r}
+YA_clean_full <- YA_clean_full %>%
+    filter(facility != "Morningside Recovery") %>%
+    filter(age_at_admit < 30)
+```
+
+### Deal with factor variables:
+
+```{r}
+YA_clean_full$gender <- as_factor(YA_clean_full$gender)
+YA_clean_full$ethnicity1 <- as_factor(YA_clean_full$ethnicity1)
+YA_clean_full$ethnicity2 <- as_factor(YA_clean_full$ethnicity2)
+YA_clean_full$affective_motivation <-
+    as_factor(YA_clean_full$affective_motivation)
+YA_clean_full$satisfaction <-
+    as_factor(YA_clean_full$satisfaction)
+YA_clean_full$effort <- as_factor(YA_clean_full$effort)
+YA_clean_full$facility_type <- as_factor(YA_clean_full$facility_type)
+```
+
+Rename factors in `facility_type`. The current levels are:
+
+```{r}
+levels(YA_clean_full$facility_type)
+```
+We change "Residential Treatment Center" to "RTC" for convenience:
+
+```{r}
+levels(YA_clean_full$facility_type) <- c("RTC", "OBH")
+levels(YA_clean_full$facility_type)
+```
+
+### Full data set (with missing values)
+
+```{r}
+skim(YA_clean_full) %>%
+    knit_print()
+```
+
+### Write full data to file
+
+```{r}
+write_csv(YA_clean_full, "./data/YA_data_clean_full.csv")
+```
+
+### Remove missing data
+
+`YA_clean_full` was the full data set. Now we remove missing data and call it `YA`.
+
+```{r}
+YA <- YA_clean_full %>%
+    drop_na(gender, age_at_admit,
+            affective_motivation, cognitive_motivation,
+            satisfaction, effort,
+            OQ_admit, OQ_discharge,
+            facility, facility_type)
+```
+
+### Assign random IDs to facilities
+
+Number of facilities:
+
+```{r}
+fac_list <- unique(YA$facility)
+```
+
+```{r}
+n_fac <- length(fac_list)
+n_fac
+```
+
+Generate random ID numbers:
+
+```{r}
+set.seed(1)
+fac_ID <- sample(1:n_fac)
+fac_ID
+```
+
+Create lookup table:
+
+```{r}
+names(fac_ID) <- fac_list
+```
+
+Assign new IDs for each facility:
+
+```{r}
+YA$fac_ID <- fac_ID[YA$facility]
+```
+
+
+### Ordered factors for Likert scales
+
+Create ordered factors from Likert scales:
+
+```{r}
+table(YA$affective_motivation)
+```
+
+```{r}
+YA$affective_motivation <- factor(YA$affective_motivation,
+        levels = c("Very negative",
+                   "Negative",
+                   "Neutral",
+                   "Somewhat positive",
+                   "Very positive"),
+        ordered = TRUE)
+table(YA$affective_motivation)
+```
+
+```{r}
+table(YA$satisfaction)
+```
+
+```{r}
+YA$satisfaction <- factor(YA$satisfaction,
+        levels = c("Very dissatisfied",
+                   "Somewhat dissatisfied",
+                   "Neutral",
+                   "Somewhat satisfied",
+                   "Very satisfied"),
+        ordered = TRUE)
+table(YA$satisfaction)
+```
+
+```{r}
+table(YA$effort)
+```
+
+```{r}
+YA$effort <- factor(YA$effort,
+        levels = c("No effort",
+                   "Little effort",
+                   "Average effort",
+                   "Above average effort",
+                   "Maximum effort"),
+        ordered = TRUE)
+table(YA$effort)
+```
+
+### Center continuous variables
+
+#### OQ admit:
+
+```{r}
+ggplot(YA, aes(x = OQ_admit)) +
+    geom_histogram()
+```
+
+```{r}
+mean(YA$OQ_admit)
+```
+
+#### Age at admit:
+
+```{r}
+ggplot(YA, aes(x = age_at_admit)) +
+    geom_histogram(binwidth = 0.5, center = 0) +
+    scale_x_continuous(breaks = seq(from = 18, to = 30))
+```
+
+
+```{r}
+median(YA$age_at_admit)
+```
+
+#### Cognitive motivation:
+
+```{r}
+ggplot(YA, aes(x = cognitive_motivation)) +
+    geom_histogram()
+```
+
+```{r}
+median(YA$cognitive_motivation)
+```
+
+Center using either mean or median:
+
+```{r}
+YA$OQ_admit_meanc <- YA$OQ_admit - mean(YA$OQ_admit)
+YA$age_at_admit_medc <-
+    YA$age_at_admit - median(YA$age_at_admit)
+YA$cognitive_motivation_medc <-
+    YA$cognitive_motivation - median(YA$cognitive_motivation)
+```
+
+### Deal with ethnicity
+
+```{r}
+YA %>%
+    unite("ethnicity", ethnicity1, ethnicity2, sep = "") %>%
+    group_by(ethnicity) %>%
+    summarize(count = n(), .groups = "drop") %>%
+    as.data.frame() %>%
+    print()
+```
+We just have to list these all out manually and classify them correctly.
+
+```{r}
+YA <- YA %>%
+    unite("ethnicity", ethnicity1, ethnicity2, sep = "") %>%
+    mutate(ethnicity_final =
+        case_when(
+            ethnicity == "0Hispanic" ~ "Hispanic/Latino",
+            ethnicity == "0White" ~ "White",
+            ethnicity == "African American" ~ "African American",
+            ethnicity == "African AmericanAfrican American" ~ 
+                "African American",
+            ethnicity == "Asian American" ~ "Asian American",
+            ethnicity == "AsianAsian American" ~ "Asian American",
+            ethnicity == "CaucasianHispanic" ~ "Other",
+            ethnicity == "CaucasianWhite" ~ "White",
+            ethnicity == "Hispanic" ~ "Hispanic/Latino",
+            ethnicity == "Hispanic or LatinoHispanic" ~
+                "Hispanic/Latino",
+            ethnicity == "Hispanic or LatinoOther" ~ "Other",
+            ethnicity == "Hispanic/LatinoHispanic" ~ 
+                "Hispanic/Latino",
+            ethnicity == "Multi-EthnicOther" ~ "Other",
+            ethnicity == "NA" ~ "Missing",
+            ethnicity == "Native American" ~ "Native American",
+            ethnicity == "Not Hispanic or LatinoAfrican American" ~ 
+                "African American",
+            ethnicity == "Not Hispanic or LatinoAsian American" ~ 
+                "Asian American",
+            ethnicity == "Not Hispanic or LatinoNative American" ~ 
+                "Native American",
+            ethnicity == "Not Hispanic or LatinoOther" ~ "Other",
+            ethnicity == "Not Hispanic or LatinoWhite" ~ "White",
+            ethnicity == "Other" ~ "Other",
+            ethnicity == "White" ~ "White"))
+```
+
+```{r}
+YA %>%
+    group_by(ethnicity_final) %>%
+    summarize(count = n(), .groups = "drop") %>%
+    as.data.frame() %>%
+    print()
+```
+
+
+
+## Final data set
+
+
+```{r}
+skim(YA) %>%
+    knit_print()
+```
+
+### Write final data set to file
+
+```{r}
+write_csv(YA, "./data/YA_data_final.csv")
+```
+
+
+
+# Data summaries
+
+
+## Summarize date variables
+
+Date range:
+
+```{r}
+min(YA$doa)
+max(YA$doa)
+```
+```{r}
+min(YA$dod)
+max(YA$dod)
+```
+
+
+## Summarize numerical variables
+
+### OQ discharge
+
+```{r}
+summary(YA$OQ_discharge)
+```
+
+```{r}
+ggplot(YA, aes(x = OQ_discharge)) +
+    geom_histogram(binwidth = 10)
+```
+
+### OQ admit
+
+```{r}
+summary(YA$OQ_admit)
+```
+
+```{r}
+ggplot(YA, aes(x = OQ_admit)) +
+    geom_histogram(binwidth = 10)
+```
+
+```{r}
+summary(YA$OQ_admit_meanc)
+```
+
+```{r}
+ggplot(YA, aes(x = OQ_admit_meanc)) +
+    geom_histogram(binwidth = 10)
+```
+
+### Cognitive motivation
+
+```{r}
+summary(YA$cognitive_motivation)
+```
+
+```{r}
+ggplot(YA, aes(x = cognitive_motivation)) +
+    geom_histogram()
+```
+
+```{r}
+summary(YA$cognitive_motivation_medc)
+```
+
+```{r}
+ggplot(YA, aes(x = cognitive_motivation_medc)) +
+    geom_histogram()
+```
+
+### Age at admit
+
+```{r}
+summary(YA$age_at_admit)
+```
+
+
+```{r}
+ggplot(YA, aes(x = age_at_admit)) +
+    geom_histogram(binwidth = 1) + 
+    scale_x_continuous(breaks = 18:29)
+```
+
+```{r}
+summary(YA$age_at_admit_medc)
+```
+
+```{r}
+ggplot(YA, aes(x = age_at_admit_medc)) +
+    geom_histogram(binwidth = 1) + 
+    scale_x_continuous(breaks = -2:9)
+```
+
+
+## Summarize categorical variables
+
+### Gender
+
+```{r}
+YA %>%
+    group_by(gender) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(percent = prop.table(count) * 100)
+```
+
+### Ethnicity
+
+```{r}
+YA %>%
+    group_by(ethnicity_final) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    arrange(desc(count)) %>%
+    mutate(percent = prop.table(count) * 100)
+```
+
+### Facility
+
+```{r}
+YA %>%
+    select(facility, facility_type) %>%
+    group_by(facility, facility_type) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    group_by(facility_type) %>%
+    summarise(count = n(), .groups = "drop")
+```
+
+```{r}
+YA %>%
+    group_by(facility_type) %>%
+    summarise(sample_size = n(), .groups = "drop") %>%
+    mutate(percent = prop.table(sample_size) * 100)
+```
+
+
+
+# Varying intercept model
+
+## Model code
+
+Default priors are good here:
+
+```{r}
+model_var_int <- brm(
+    OQ_discharge ~ 1 +
+        (1 | fac_ID) +
+        gender +
+        OQ_admit_meanc +
+        age_at_admit_medc +
+        facility_type +
+        mo(affective_motivation) +
+        cognitive_motivation_medc +
+        mo(satisfaction) +
+        mo(effort),
+    data = YA,
+    chains = 3,
+    cores = parallel::detectCores() - 1,
+    seed = 10,
+    save_model = TRUE,
+    file = "model_var_int"
+    )
+```
+
+Check the data and model (especially to understand prior structure):
+
+```{r}
+data_var_int <- standata(model_var_int)
+str(data_var_int)
+```
+
+```{r}
+model_var_int$model
+```
+
+## Model summary
+
+### Coefficients
+
+```{r}
+summary(model_var_int)
+```
+
+### Fixed effects
+
+```{r}
+fixef(model_var_int)
+```
+
+### Random effects
+
+```{r}
+ranef(model_var_int)
+```
+
+### Total effects (fixed effects plus random effects):
+
+```{r}
+coef(model_var_int)
+```
+
+### Conditional effects
+
+```{r}
+effects_var_int_affective_motivation_gender <-
+    conditional_effects(model_var_int,
+            effects = "affective_motivation:gender")
+plot(effects_var_int_affective_motivation_gender,
+     plot = FALSE)[[1]] +
+     theme(axis.text.x =
+               element_text(angle = 45, vjust = 1, hjust = 1)) 
+```
+
+```{r}
+effects_var_int_affective_motivation_fac <-
+    conditional_effects(model_var_int,
+            effects = "affective_motivation:facility_type")
+plot(effects_var_int_affective_motivation_fac,
+     plot = FALSE)[[1]] +
+     theme(axis.text.x =
+               element_text(angle = 45, vjust = 1, hjust = 1)) 
+```
+
+```{r}
+effects_var_int_cognitive_motivation_gender <-
+    conditional_effects(model_var_int,
+            effects = "cognitive_motivation_medc:gender")
+plot(effects_var_int_cognitive_motivation_gender,
+     plot = FALSE)[[1]]
+```
+
+```{r}
+effects_var_int_cognitive_motivation_fac <-
+    conditional_effects(model_var_int,
+        effects = "cognitive_motivation_medc:facility_type")
+plot(effects_var_int_cognitive_motivation_fac,
+     plot = FALSE)[[1]]
+```
+
+```{r}
+effects_var_int_satisfaction_gender <-
+    conditional_effects(model_var_int,
+                effects = "satisfaction:gender")
+plot(effects_var_int_satisfaction_gender,
+     plot = FALSE)[[1]] +    
+     theme(axis.text.x =
+               element_text(angle = 45, vjust = 1, hjust = 1)) 
+```
+
+```{r}
+effects_var_int_satisfaction_fac <-
+    conditional_effects(model_var_int,
+                effects = "satisfaction:facility_type")
+plot(effects_var_int_satisfaction_fac,
+     plot = FALSE)[[1]] +    
+     theme(axis.text.x =
+               element_text(angle = 45, vjust = 1, hjust = 1)) 
+```
+
+```{r}
+effects_var_int_effort_gender <-
+    conditional_effects(model_var_int,
+                effects = "effort:gender")
+plot(effects_var_int_effort_gender, plot = FALSE)[[1]] +    
+     theme(axis.text.x =
+               element_text(angle = 45, vjust = 1, hjust = 1)) 
+```
+
+```{r}
+effects_var_int_effort_fac <-
+    conditional_effects(model_var_int,
+                effects = "effort:facility_type")
+plot(effects_var_int_effort_fac, plot = FALSE)[[1]] +    
+     theme(axis.text.x =
+               element_text(angle = 45, vjust = 1, hjust = 1)) 
+```
+
+```{r}
+effects_var_int_OQ_admit_gender <-
+    conditional_effects(model_var_int,
+            effects = "OQ_admit_meanc:gender")
+plot(effects_var_int_OQ_admit_gender,
+     plot = FALSE)[[1]]
+```
+
+```{r}
+effects_var_int_age_gender <-
+    conditional_effects(model_var_int,
+            effects = "age_at_admit_medc:gender")
+plot(effects_var_int_age_gender,
+     plot = FALSE)[[1]]
+```
+
+
+## Extract draws
+
+```{r}
+parnames(model_var_int)
+```
+
+```{r}
+draws_p <- model_var_int %>%
+    spread_draws(b_Intercept,
+                 b_genderMALE,
+                 b_OQ_admit_meanc,
+                 b_age_at_admit_medc,
+                 b_facility_typeRTC,
+                 b_cognitive_motivation_medc,
+                 bsp_moaffective_motivation,
+                 bsp_mosatisfaction,
+                 bsp_moeffort,
+                 sd_fac_ID__Intercept,
+                 sigma)
+glimpse(draws_p)
+```
+
+```{r}
+draws_p_gather <- model_var_int %>%
+    gather_draws(b_Intercept,
+                 b_genderMALE,
+                 b_OQ_admit_meanc,
+                 b_age_at_admit_medc,
+                 b_facility_typeRTC,
+                 b_cognitive_motivation_medc,
+                 bsp_moaffective_motivation,
+                 bsp_mosatisfaction,
+                 bsp_moeffort,
+                 sd_fac_ID__Intercept,
+                 sigma)
+glimpse(draws_p_gather)
+```
+
+```{r}
+draws_mo <- model_var_int %>%
+    spread_draws(simo_moaffective_motivation1[1:4],
+                 simo_mosatisfaction1[1:4],
+                 simo_moeffort1[1:4])
+glimpse(draws_mo)
+```
+
+```{r}
+draws_mo_gather <- model_var_int %>%
+    gather_draws(simo_moaffective_motivation1[1:4],
+                 simo_mosatisfaction1[1:4],
+                 simo_moeffort1[1:4])
+glimpse(draws_mo_gather)
+```
+
+```{r}
+draws_r <- model_var_int %>%
+    spread_draws(r_fac_ID[fac_ID, ])
+glimpse(draws_r)
+```
+
+```{r}
+draws_r_gather <- model_var_int %>%
+    gather_draws(r_fac_ID[fac_ID, ])
+glimpse(draws_r_gather)
+```
+
+## Posterior summaries
+
+### Population
+
+```{r}
+draws_p %>%
+    median_qi()
+```
+
+```{r}
+draws_p_gather %>%
+    median_qi()
+```
+
+### Monotonic ordinal
+
+```{r}
+draws_mo %>%
+    median_qi()
+```
+
+```{r}
+draws_mo_gather %>%
+    median_qi()
+```
+
+BUT, medians will not add up to 100%. That's why we need means for the simo parameters:
+
+```{r}
+draws_mo %>%
+    mean_qi()
+```
+
+```{r}
+draws_mo_gather %>%
+    mean_qi()
+```
+
+### Random effects
+
+```{r}
+draws_r %>%
+    median_qi()
+```
+
+```{r}
+draws_r_gather %>%
+    median_qi()
+```
+
+## Posterior graphs
+
+Simplify theme:
+
+```{r}
+theme_set(theme_tidybayes() + panel_border())
+```
+
+All credible intervals are 80% and 95%.
+
+```{r}
+draws_p_gather %>%
+    filter(str_detect(.variable, "^b_")) %>%
+    ggplot(aes(y = .variable, x = .value)) +
+    stat_pointinterval()
+```
+
+```{r}
+draws_p_gather %>%
+    filter(.variable == "b_OQ_admit_meanc") %>%
+    ggplot(aes(y = .variable, x = .value)) +
+    stat_halfeye()
+```
+
+```{r}
+draws_p_gather %>%
+    filter(.variable == "b_Intercept") %>%
+    ggplot(aes(y = .variable, x = .value)) +
+    stat_halfeye()
+```
+
+```{r}
+draws_p_gather %>%
+    filter(.variable == "b_genderMALE") %>%
+    ggplot(aes(y = .variable, x = .value)) +
+    stat_halfeye()
+```
+
+```{r}
+draws_p_gather %>%
+    filter(.variable == "b_facility_typeRTC") %>%
+    ggplot(aes(y = .variable, x = .value)) +
+    stat_halfeye()
+```
+
+```{r}
+draws_p_gather %>%
+    filter(.variable == "b_cognitive_motivation_medc") %>%
+    ggplot(aes(y = .variable, x = .value)) +
+    stat_halfeye()
+```
+
+```{r}
+draws_p_gather %>%
+    filter(.variable == "b_age_at_admit_medc") %>%
+    ggplot(aes(y = .variable, x = .value)) +
+    stat_halfeye()
+```
+
+```{r}
+draws_p_gather %>%
+    filter(str_detect(.variable, "^bsp_")) %>%
+    ggplot(aes(y = .variable, x = .value)) +
+    stat_halfeye()
+```
+
+```{r}
+draws_r %>%
+    ggplot(aes(y = factor(fac_ID), x = r_fac_ID)) +
+    stat_pointinterval()
+```
+
+
+## Posteriors for ordinal predictors
+
+### Get all ordinal parts into one data frame
+
+```{r}
+draws_mo_unspread <- draws_mo %>%
+    unspread_draws(simo_moaffective_motivation1[1:4],
+                   simo_mosatisfaction1[1:4],
+                   simo_moeffort1[1:4])
+str(draws_mo_unspread)
+```
+
+```{r}
+draws_bsp <- draws_p %>%
+    select(starts_with("bsp_"), starts_with("."))
+str(draws_bsp)
+```
+
+```{r}
+draws_mo_all <- inner_join(draws_bsp, draws_mo_unspread,
+                           by = ".draw") %>%
+    select(-ends_with(".x")) %>%
+    select(-ends_with(".y")) %>%
+    mutate(affective_motivation_cum1 = 
+               bsp_moaffective_motivation * 4 *
+               `simo_moaffective_motivation1[1]`,
+           affective_motivation_cum2 = 
+               affective_motivation_cum1 +
+               bsp_moaffective_motivation * 4 *
+               `simo_moaffective_motivation1[2]`,
+           affective_motivation_cum3 = 
+               affective_motivation_cum2 +
+               bsp_moaffective_motivation * 4 *
+               `simo_moaffective_motivation1[3]`,
+           affective_motivation_cum4 =
+               affective_motivation_cum3 +
+               bsp_moaffective_motivation * 4 *
+               `simo_moaffective_motivation1[4]`,
+           satisfaction_cum1 = 
+               bsp_mosatisfaction * 4 *
+               `simo_mosatisfaction1[1]`,
+           satisfaction_cum2 = 
+               satisfaction_cum1 +
+               bsp_mosatisfaction * 4 *
+               `simo_mosatisfaction1[2]`,
+           satisfaction_cum3 = 
+               satisfaction_cum2 +
+               bsp_mosatisfaction * 4 *
+               `simo_mosatisfaction1[3]`,
+           satisfaction_cum4 = 
+               satisfaction_cum3 +
+               bsp_mosatisfaction * 4 *
+               `simo_mosatisfaction1[4]`,
+           effort_cum1 = 
+               bsp_moeffort * 4 *
+               `simo_moeffort1[1]`,
+           effort_cum2 = 
+               effort_cum1 +
+               bsp_moeffort * 4 *
+               `simo_moeffort1[2]`,
+           effort_cum3 = 
+               effort_cum2 +
+               bsp_moeffort * 4 *
+               `simo_moeffort1[3]`,
+           effort_cum4 = 
+               effort_cum3 +
+               bsp_moeffort * 4 *
+               `simo_moeffort1[4]`,)
+glimpse(draws_mo_all)
+```
+
+### Summarize and plot
+
+```{r}
+draws_mo_all[1,]
+```
+
+```{r}
+draws_mo_all %>%
+    select(starts_with("aff")) %>%
+    pivot_longer(starts_with("aff"),
+                 names_to = "variable") %>%
+    ggplot(aes(y = fct_rev(variable), x = value)) +
+    stat_halfeye(point_interval = mean_qi)
+```
+
+
+```{r}
+draws_mo_all %>%
+    select(starts_with("sat")) %>%
+    pivot_longer(starts_with("sat"),
+                 names_to = "variable") %>%
+    ggplot(aes(y = fct_rev(variable), x = value)) +
+    stat_halfeye(point_interval = mean_qi)
+```
+
+```{r}
+draws_mo_all %>%
+    select(starts_with("eff")) %>%
+    pivot_longer(starts_with("eff"),
+                 names_to = "variable") %>%
+    ggplot(aes(y = fct_rev(variable), x = value)) +
+    stat_halfeye(point_interval = mean_qi)
+```
+
+
+# Final graphs for publication
+
+```{r}
+Q13_plot <- ggplot(YA, aes(x = cognitive_motivation)) +
+    geom_histogram(binwidth = 3) +
+    labs(title = "Histogram of responses to Q13 of 
+NATSAP Adult Questionnaire-Initial:",
+        subtitle = "\"It makes sense for me to be in a therapeutic program.\"",
+        y = "Count",
+        x = "Response")
+Q13_plot
+```
+
+```{r}
+Q10_plot <- ggplot(YA, aes(x = affective_motivation)) +
+    geom_bar() +
+    labs(title = "Bar chart of responses to Q10 of
+NATSAP Adult Questionnaire-Initial:",
+        subtitle = "\"How do you feel about being at this program?\"",
+        y = "Count",
+        x = "Response") +
+     theme(axis.text.x =
+               element_text(angle = 30, vjust = 1, hjust = 1))
+Q10_plot
+```
+```{r}
+Q5_plot <- ggplot(YA, aes(x = satisfaction)) +
+    geom_bar() +
+    labs(title = "Bar chart of responses to Q5 of
+NATSAP Adult Questionnaire-Discharge:",
+        subtitle = "\"Currently, how satisfied are you with the
+quality of treatment you received at the program\"",
+        y = "Count",
+        x = "Response") +
+     theme(axis.text.x =
+               element_text(angle = 30, vjust = 1, hjust = 1))
+Q5_plot
+```
+```{r}
+Q6_plot <- ggplot(YA, aes(x = effort)) +
+    geom_bar() +
+    labs(title = "Bar chart of responses to Q6 of
+NATSAP Adult Questionnaire-Discharge:",
+        subtitle = "\"How much effort did you put into your treatment at the program?\"",
+        y = "Count",
+        x = "Response") +
+     theme(axis.text.x =
+               element_text(angle = 30, vjust = 1, hjust = 1))
+Q6_plot
+```
+```{r, fig.height = 10, fig.width = 10}
+wrap_plots(Q13_plot, Q10_plot, Q5_plot, Q6_plot)
+```
+
+```{r, fig.width = 8}
+draws_p_gather %>%
+    filter(str_detect(.variable, "^bsp_")) %>%
+    mutate(.variable = factor(.variable, levels = c("bsp_moeffort",
+                                                    "bsp_mosatisfaction",
+                                                    "bsp_moaffective_motivation"))) %>%
+    ggplot(aes(y = .variable, x = .value)) +
+    stat_halfeye(point_interval = mean_qi) +
+    labs(title = "Posterior distributions for the coefficients of monotonic ordinal
+regressors, with means and 80%/95% credible intervals.",
+         subtitle = "Coefficient values represent the average change in OQ discharge score
+predicted by the model between one level of the ordinal predictor and the next.",
+         y = "Coefficient",
+         x = "Coefficient value") +
+    scale_y_discrete(labels = c("effort",
+                                "satisfaction",
+                                "affectivemotivation")) +
+    geom_vline(xintercept = 0)
+```
+
+```{r, fig.width = 8}
+draws_mo_all %>%
+    select(starts_with("aff")) %>%
+    pivot_longer(starts_with("aff"),
+                 names_to = "variable") %>%
+    ggplot(aes(y = fct_rev(variable), x = value)) +
+    stat_halfeye(point_interval = mean_qi) +
+    labs(title = "Posterior distributions for the predicted changes in OQ
+discharge score at each level of affective motivation,
+with means and 80%/95% credible intervals",
+        subtitle = "Each level is relative to the baseline value of \"Very negative.\"",
+         y = "Levels of affective motivation",
+         x = "Predicted OQ discharge score change") +
+    scale_y_discrete(labels = c("Very positive",
+                                "Somewhat positive",
+                                "Neutral",
+                                "Negative")) +
+    lims(x = c(-42, 4)) +
+    geom_vline(xintercept = 0)
+```
+
+```{r, fig.width = 8}
+draws_mo_all %>%
+    select(starts_with("sat")) %>%
+    pivot_longer(starts_with("sat"),
+                 names_to = "variable") %>%
+    ggplot(aes(y = fct_rev(variable), x = value)) +
+    stat_halfeye(point_interval = mean_qi) +
+    labs(title = "Posterior distributions for the predicted changes in OQ
+discharge score at each level of satisfaction,
+with means and 80%/95% credible intervals",
+        subtitle = "Each level is relative to the baseline value of \"Very dissatisfied.\"",
+         y = "Levels of satisfaction",
+         x = "Predicted OQ discharge score change") +
+    scale_y_discrete(labels = c("Very satisfied",
+                                "Somewhat satisfied",
+                                "Neutral",
+                                "Somewhat dissatisfied")) +
+    lims(x = c(-42, 4)) +
+    geom_vline(xintercept = 0)
+```
+
+```{r, fig.width = 8}
+draws_mo_all %>%
+    select(starts_with("eff")) %>%
+    pivot_longer(starts_with("eff"),
+                 names_to = "variable") %>%
+    ggplot(aes(y = fct_rev(variable), x = value)) +
+    stat_halfeye(point_interval = mean_qi) +
+    labs(title = "Posterior distributions for the predicted changes in OQ
+discharge score at each level of effort,
+with means and 80%/95% credible intervals",
+        subtitle = "Each level is relative to the baseline value of \"No effort.\"",
+         y = "Levels of effort",
+         x = "Predicted OQ discharge score change") +
+    scale_y_discrete(labels = c("Maximum effort",
+                                "Above average effort",
+                                "Average effort",
+                                "Little effort")) +
+    lims(x = c(-42, 4)) +
+    geom_vline(xintercept = 0)
+```
+
+
+# Tables (not formatted yet)
+
+All model coefficients:
+
+```{r}
+summary(model_var_int, priors = TRUE)
+```
+
+Random effects (deviations from overall intercept for each of the 21 programs):
+
+```{r}
+ranef(model_var_int)
+```
